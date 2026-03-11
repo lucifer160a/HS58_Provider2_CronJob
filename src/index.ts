@@ -30,6 +30,7 @@ import {
 import { DrainService } from './drain.js';
 import { VoucherStorage } from './storage.js';
 import { CronJobOrgService } from './cronjob.js';
+import { TelegramMonitor } from './telegram.js';
 import { formatUnits } from 'viem';
 import type {
   CreateJobInput,
@@ -43,10 +44,31 @@ const config = loadConfig();
 const storage = new VoucherStorage(config.storagePath);
 const drainService = new DrainService(config, storage);
 const cronService = new CronJobOrgService(config.cronjobApiKey);
+const telegram = new TelegramMonitor(config);
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
+
+// ---------------------------------------------------------------------------
+// Request monitoring — notify Telegram for every API request
+// ---------------------------------------------------------------------------
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const ip = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ?? req.ip ?? req.socket?.remoteAddress ?? 'unknown';
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    telegram.notifyRequest(req.method, req.path, res.statusCode, duration, ip);
+  });
+  next();
+});
+
+// ---------------------------------------------------------------------------
+// GET /  — redirect to docs
+// ---------------------------------------------------------------------------
+
+app.get('/', (_req, res) => res.redirect('/v1/docs'));
 
 // ---------------------------------------------------------------------------
 // GET /v1/pricing
@@ -168,6 +190,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   // 1. Require voucher
   const voucherHeader = req.headers['x-drain-voucher'] as string;
   if (!voucherHeader) {
+    telegram.notifyAsync({
+      operation: 'payment required',
+      status: 'error',
+      error: 'Missing X-DRAIN-Voucher header',
+    });
     res.status(402).json({
       error: { message: 'Payment required. Include X-DRAIN-Voucher header.' },
     });
@@ -177,6 +204,11 @@ app.post('/v1/chat/completions', async (req, res) => {
   // 2. Parse voucher
   const voucher = drainService.parseVoucherHeader(voucherHeader);
   if (!voucher) {
+    telegram.notifyAsync({
+      operation: 'invalid voucher',
+      status: 'error',
+      error: 'Invalid voucher format',
+    });
     res.status(402).json({ error: { message: 'Invalid voucher format.' } });
     return;
   }
@@ -198,6 +230,13 @@ app.post('/v1/chat/completions', async (req, res) => {
   // 4. Validate voucher
   const validation = await drainService.validateVoucher(voucher, cost);
   if (!validation.valid) {
+    telegram.notifyAsync({
+      operation: 'voucher validation failed',
+      status: 'error',
+      modelId,
+      error: validation.error ?? 'unknown',
+      extra: validation.error === 'insufficient_funds' ? { required: cost.toString() } : undefined,
+    });
     res.status(402).json({
       error: { message: `Voucher error: ${validation.error}` },
       ...(validation.error === 'insufficient_funds' && {
@@ -253,6 +292,15 @@ app.post('/v1/chat/completions', async (req, res) => {
           jobId: created.jobId,
           message: `Cron job created successfully. Store jobId ${created.jobId} to manage this job later.`,
         };
+        telegram.notifyAsync({
+          operation: 'cronjob/create',
+          status: 'success',
+          modelId: 'cronjob/create',
+          visitUrl: jobInput.url,
+          details: `jobId=${created.jobId}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -265,6 +313,15 @@ app.post('/v1/chat/completions', async (req, res) => {
         const { jobId, ...delta } = upd;
         await cronService.updateJob(jobId, delta);
         result = { operation: 'updated', jobId, message: 'Cron job updated successfully.' };
+        telegram.notifyAsync({
+          operation: 'cronjob/update',
+          status: 'success',
+          modelId: 'cronjob/update',
+          visitUrl: delta.url,
+          details: `jobId=${jobId}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -280,6 +337,14 @@ app.post('/v1/chat/completions', async (req, res) => {
           jobId: del.jobId,
           message: 'Cron job deleted successfully.',
         };
+        telegram.notifyAsync({
+          operation: 'cronjob/delete',
+          status: 'success',
+          modelId: 'cronjob/delete',
+          details: `jobId=${del.jobId}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -291,6 +356,17 @@ app.post('/v1/chat/completions', async (req, res) => {
           jobs: list.jobs,
           someFailed: list.someFailed,
         };
+        const listUrls = list.jobs.map((j: { url?: string }) => j.url).filter(Boolean) as string[];
+        telegram.notifyAsync({
+          operation: 'cronjob/list',
+          status: 'success',
+          modelId: 'cronjob/list',
+          visitCount: list.jobs.length,
+          visitUrls: listUrls.length > 0 ? listUrls : undefined,
+          details: `count=${list.jobs.length}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -302,6 +378,15 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         const detail = await cronService.getJob(g.jobId);
         result = { operation: 'get', jobDetails: detail.jobDetails };
+        telegram.notifyAsync({
+          operation: 'cronjob/get',
+          status: 'success',
+          modelId: 'cronjob/get',
+          visitUrl: detail.jobDetails?.url,
+          details: `jobId=${g.jobId}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -320,6 +405,17 @@ app.post('/v1/chat/completions', async (req, res) => {
             new Date(ts * 1000).toISOString()
           ),
         };
+        const visitUrl = hist.history.length > 0 ? hist.history[0].url : undefined;
+        telegram.notifyAsync({
+          operation: 'cronjob/history',
+          status: 'success',
+          modelId: 'cronjob/history',
+          visitUrl,
+          visitCount: hist.history.length,
+          details: `jobId=${h.jobId}`,
+          cost: formatUnits(cost, 6),
+          channelId: voucher.channelId,
+        });
         break;
       }
 
@@ -328,9 +424,16 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
     }
   } catch (error: any) {
+    const errMsg = error.message?.slice(0, 300) ?? 'unknown error';
     console.error(`[cronjob] Operation ${modelId} failed:`, error.message);
+    telegram.notifyAsync({
+      operation: 'cronjob API error',
+      status: 'error',
+      modelId,
+      error: errMsg,
+    });
     res.status(502).json({
-      error: { message: `cron-job.org API error: ${error.message?.slice(0, 300)}` },
+      error: { message: `cron-job.org API error: ${errMsg}` },
     });
     return;
   }
@@ -378,8 +481,19 @@ app.post('/v1/admin/claim', async (req, res) => {
   try {
     const forceAll = req.body?.forceAll === true;
     const txHashes = await drainService.claimPayments(forceAll);
+    telegram.notifyAsync({
+      operation: 'admin/claim',
+      status: 'success',
+      details: `claimed=${txHashes.length} forceAll=${forceAll}`,
+      extra: { txCount: txHashes.length },
+    });
     res.json({ claimed: txHashes.length, transactions: txHashes });
   } catch (error: any) {
+    telegram.notifyAsync({
+      operation: 'admin/claim',
+      status: 'error',
+      error: error.message,
+    });
     res.status(500).json({ error: error.message });
   }
 });
@@ -427,12 +541,22 @@ app.post('/v1/close-channel', async (req, res) => {
     if (!channelId) return res.status(400).json({ error: 'channelId required' });
 
     const result = await drainService.signCloseAuthorization(channelId);
+    telegram.notifyAsync({
+      operation: 'close-channel',
+      status: 'success',
+      details: `channelId=${channelId?.slice(0, 18)}… finalAmount=${result.finalAmount.toString()}`,
+    });
     res.json({
       channelId,
       finalAmount: result.finalAmount.toString(),
       signature: result.signature,
     });
   } catch (error: any) {
+    telegram.notifyAsync({
+      operation: 'close-channel',
+      status: 'error',
+      error: error?.message || 'internal_error',
+    });
     console.error('[close-channel] Error:', error?.message || error);
     res.status(500).json({ error: 'internal_error' });
   }
@@ -464,6 +588,18 @@ async function start() {
   } catch (error: any) {
     console.warn(`[startup] WARNING: cron-job.org API check failed: ${error.message}`);
     console.warn('[startup] Continuing anyway — check CRONJOB_API_KEY if requests fail.');
+  }
+
+  if (telegram.isEnabled()) {
+    telegram.notifyAsync({
+      operation: 'provider started',
+      status: 'success',
+      details: `${config.providerName} on port ${config.port}`,
+      extra: {
+        chainId: config.chainId,
+        operations: getSupportedModels().length,
+      },
+    });
   }
 
   // Start auto-claiming expiring channels
